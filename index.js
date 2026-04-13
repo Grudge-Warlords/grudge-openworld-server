@@ -2,15 +2,24 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 
 const PORT = process.env.PORT || 5001;
+const GRUDGE_API = process.env.GRUDGE_API_URL || "https://api.grudge-studio.com";
+const SAVE_INTERVAL_MS = 30_000; // Auto-save island state every 30s
 
 const httpServer = createServer((req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", worlds: worlds.size, players: totalPlayers(), uptime: process.uptime() }));
+    res.end(JSON.stringify({
+      status: "ok",
+      worlds: worlds.size,
+      islands: islands.size,
+      players: totalPlayers(),
+      uptime: process.uptime(),
+    }));
     return;
   }
   res.writeHead(200, { "Content-Type": "text/html" });
-  res.end(`<h1>Grudge Open World Server</h1><p>Worlds: ${worlds.size} | Players: ${totalPlayers()}</p>`);
+  res.end(`<h1>Grudge Open World Server</h1><p>Worlds: ${worlds.size} | Islands: ${islands.size} | Players: ${totalPlayers()}</p>`);
 });
 
 const io = new Server(httpServer, {
@@ -18,7 +27,7 @@ const io = new Server(httpServer, {
   path: "/world",
 });
 
-// ─── World Instance ────────────────────────────────────────────
+// ─── World Instance (existing arena/lobby system) ──────────────
 const worlds = new Map();
 let nextPlayerId = 1;
 
@@ -60,10 +69,103 @@ setInterval(() => {
   }
 }, 60000);
 
+// ═══════════════════════════════════════════════════════════════
+// ISLAND SYSTEM — PvE zones, harvesting, PvP, auto-save
+// ═══════════════════════════════════════════════════════════════
+
+const islands = new Map(); // "island:{id}" → island state
+
+function getOrCreateIsland(islandId) {
+  const key = `island:${islandId}`;
+  if (!islands.has(key)) {
+    islands.set(key, {
+      id: islandId,
+      players: new Map(),
+      enemies: new Map(),
+      harvestCooldowns: new Map(), // nodeId → respawnAt timestamp
+      lastSave: Date.now(),
+      dirty: false,
+    });
+  }
+  return islands.get(key);
+}
+
+// PvE enemy templates
+const ENEMY_TEMPLATES = [
+  { type: "slime",    hp: 60,  dmg: 8,  xp: 15,  gold: 5,  speed: 1.5 },
+  { type: "skeleton", hp: 120, dmg: 15, xp: 30,  gold: 12, speed: 1.2 },
+  { type: "orc",      hp: 200, dmg: 25, xp: 50,  gold: 20, speed: 1.0 },
+  { type: "troll",    hp: 400, dmg: 40, xp: 100, gold: 45, speed: 0.7 },
+  { type: "dragon",   hp: 1200, dmg: 80, xp: 300, gold: 150, speed: 0.5 },
+];
+
+let nextEnemyId = 1;
+
+function spawnEnemy(island, zoneLevel = 1) {
+  const templateIdx = Math.min(zoneLevel - 1, ENEMY_TEMPLATES.length - 1);
+  const template = ENEMY_TEMPLATES[templateIdx];
+  const scaleMult = 1 + (zoneLevel - 1) * 0.3;
+  const id = `e_${nextEnemyId++}`;
+  const enemy = {
+    id,
+    ...template,
+    hp: Math.floor(template.hp * scaleMult),
+    maxHp: Math.floor(template.hp * scaleMult),
+    dmg: Math.floor(template.dmg * scaleMult),
+    x: (Math.random() - 0.5) * 300,
+    y: 0,
+    z: (Math.random() - 0.5) * 300,
+    state: "idle",
+    targetPlayerId: null,
+    spawnedAt: Date.now(),
+  };
+  island.enemies.set(id, enemy);
+  return enemy;
+}
+
+// Auto-save dirty islands to Grudge VPS
+setInterval(async () => {
+  for (const [key, island] of islands) {
+    if (!island.dirty || island.players.size === 0) continue;
+    try {
+      // Save via Grudge backend (if configured)
+      if (GRUDGE_API) {
+        // POST to VPS — non-blocking, fire and forget
+        fetch(`${GRUDGE_API}/api/island/state`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            islandId: island.id,
+            nodes: Array.from(island.harvestCooldowns.entries()).map(([k, v]) => ({ id: k, respawnAt: v })),
+            enemies: island.enemies.size,
+            timestamp: Date.now(),
+          }),
+        }).catch(e => console.warn(`[save] Failed for ${key}:`, e.message));
+      }
+      island.dirty = false;
+      island.lastSave = Date.now();
+      console.log(`[save] Saved island ${island.id}`);
+    } catch (e) {
+      console.warn(`[save] Error saving ${key}:`, e.message);
+    }
+  }
+}, SAVE_INTERVAL_MS);
+
+// Clean empty islands every 5 min
+setInterval(() => {
+  for (const [key, island] of islands) {
+    if (island.players.size === 0 && Date.now() - island.lastSave > 10 * 60 * 1000) {
+      islands.delete(key);
+      console.log(`[island] ${key} cleaned up (empty)`);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // ─── Socket.io ─────────────────────────────────────────────────
 io.on("connection", (socket) => {
   console.log(`[world] connected: ${socket.id}`);
   let currentWorld = null;
+  let currentIsland = null;
   let playerId = nextPlayerId++;
 
   // List public worlds
@@ -191,9 +293,259 @@ io.on("connection", (socket) => {
     });
   });
 
+  // ═══════════════════════════════════════════════════════════════
+  // ISLAND EVENTS — join/leave, harvest, PvE combat, PvP, save
+  // ═══════════════════════════════════════════════════════════════
+
+  // Join an island instance
+  socket.on("island:join", (data, cb) => {
+    const { islandId, playerName, heroId, heroClass, heroRace, accountId } = data;
+    if (!islandId) return cb?.({ error: "islandId required" });
+
+    const island = getOrCreateIsland(islandId);
+    const roomKey = `island:${islandId}`;
+    currentIsland = roomKey;
+    socket.join(roomKey);
+
+    island.players.set(socket.id, {
+      id: playerId,
+      name: playerName,
+      accountId,
+      heroId, heroClass, heroRace,
+      x: 0, y: 0, z: 0,
+      facing: 0,
+      hp: 200, maxHp: 200,
+      level: 1,
+      state: "idle",
+      faction: null,
+      lastUpdate: Date.now(),
+    });
+
+    // Notify others on the island
+    socket.to(roomKey).emit("island:player_joined", {
+      id: playerId, name: playerName, heroId, heroClass, heroRace,
+    });
+
+    // Send existing players + enemies to the joiner
+    const players = [];
+    for (const [, p] of island.players) players.push(p);
+    const enemies = [];
+    for (const [, e] of island.enemies) enemies.push(e);
+
+    console.log(`[island] ${playerName} joined island ${islandId} (${island.players.size} players)`);
+    cb?.({
+      playerId,
+      players,
+      enemies,
+      harvestCooldowns: Object.fromEntries(island.harvestCooldowns),
+    });
+
+    // Auto-spawn PvE enemies if island is empty of them
+    if (island.enemies.size === 0) {
+      const count = 3 + Math.floor(Math.random() * 4);
+      for (let i = 0; i < count; i++) {
+        const enemy = spawnEnemy(island, 1);
+        io.to(roomKey).emit("pve:spawn", enemy);
+      }
+    }
+  });
+
+  // Leave island
+  socket.on("island:leave", () => {
+    if (!currentIsland) return;
+    const island = islands.get(currentIsland);
+    if (island) {
+      const player = island.players.get(socket.id);
+      island.players.delete(socket.id);
+      if (player) {
+        io.to(currentIsland).emit("island:player_left", { id: player.id, name: player.name });
+      }
+    }
+    socket.leave(currentIsland);
+    currentIsland = null;
+  });
+
+  // Island player position update (same 15Hz pattern)
+  socket.on("island:update", (data) => {
+    if (!currentIsland) return;
+    const island = islands.get(currentIsland);
+    if (!island) return;
+    const player = island.players.get(socket.id);
+    if (!player) return;
+
+    player.x = data.x ?? player.x;
+    player.y = data.y ?? player.y;
+    player.z = data.z ?? player.z;
+    player.facing = data.facing ?? player.facing;
+    player.state = data.state ?? player.state;
+    player.hp = data.hp ?? player.hp;
+    player.lastUpdate = Date.now();
+
+    socket.volatile.to(currentIsland).emit("island:player_moved", {
+      id: player.id,
+      x: player.x, y: player.y, z: player.z,
+      facing: player.facing,
+      state: player.state,
+      hp: player.hp,
+    });
+  });
+
+  // ── Harvesting ────────────────────────────────────────────────
+  socket.on("harvest:start", (data, cb) => {
+    if (!currentIsland) return cb?.({ error: "Not on an island" });
+    const island = islands.get(currentIsland);
+    if (!island) return cb?.({ error: "Island not found" });
+
+    const { nodeId, professionId } = data;
+    const now = Date.now();
+
+    // Check cooldown
+    const respawnAt = island.harvestCooldowns.get(nodeId) || 0;
+    if (respawnAt > now) {
+      return cb?.({ error: "Node on cooldown", respawnAt });
+    }
+
+    // Set cooldown (60s for trees, 90s for rocks)
+    const cooldown = nodeId.startsWith("tree") ? 60000 : 90000;
+    island.harvestCooldowns.set(nodeId, now + cooldown);
+    island.dirty = true;
+
+    // Broadcast to all on the island
+    io.to(currentIsland).emit("harvest:complete", {
+      nodeId,
+      playerId,
+      professionId,
+      respawnAt: now + cooldown,
+    });
+
+    cb?.({ success: true, respawnAt: now + cooldown });
+  });
+
+  // ── PvE Combat (server-authoritative damage) ──────────────────
+  socket.on("pve:attack", (data, cb) => {
+    if (!currentIsland) return;
+    const island = islands.get(currentIsland);
+    if (!island) return;
+    const player = island.players.get(socket.id);
+    if (!player) return;
+
+    const { enemyId, damage } = data;
+    const enemy = island.enemies.get(enemyId);
+    if (!enemy) return cb?.({ error: "Enemy not found" });
+
+    // Server validates damage (cap at reasonable max)
+    const validatedDmg = Math.min(damage || 0, 500);
+    enemy.hp -= validatedDmg;
+
+    io.to(currentIsland).emit("pve:damage", {
+      enemyId,
+      damage: validatedDmg,
+      hp: enemy.hp,
+      attackerId: playerId,
+    });
+
+    // Enemy killed
+    if (enemy.hp <= 0) {
+      island.enemies.delete(enemyId);
+      island.dirty = true;
+      io.to(currentIsland).emit("pve:kill", {
+        enemyId,
+        killerId: playerId,
+        xp: enemy.xp,
+        gold: enemy.gold,
+        type: enemy.type,
+      });
+
+      // Respawn a new enemy after 15-30s
+      const respawnDelay = 15000 + Math.random() * 15000;
+      setTimeout(() => {
+        if (!islands.has(currentIsland)) return;
+        const isl = islands.get(currentIsland);
+        if (isl.players.size === 0) return;
+        const newEnemy = spawnEnemy(isl, 1);
+        io.to(currentIsland).emit("pve:spawn", newEnemy);
+      }, respawnDelay);
+
+      cb?.({ killed: true, xp: enemy.xp, gold: enemy.gold });
+    } else {
+      cb?.({ killed: false, hp: enemy.hp });
+    }
+  });
+
+  // ── PvP Combat (zone-based, faction wars) ─────────────────────
+  socket.on("pvp:attack", (data) => {
+    if (!currentIsland) return;
+    const island = islands.get(currentIsland);
+    if (!island) return;
+    const attacker = island.players.get(socket.id);
+    if (!attacker) return;
+
+    const { targetPlayerId, damage } = data;
+    // Find target socket by player ID
+    let targetSocketId = null;
+    for (const [sid, p] of island.players) {
+      if (p.id === targetPlayerId) { targetSocketId = sid; break; }
+    }
+    if (!targetSocketId) return;
+    const target = island.players.get(targetSocketId);
+    if (!target) return;
+
+    // Same faction = no PvP (unless in arena zone)
+    if (attacker.faction && attacker.faction === target.faction) return;
+
+    const validatedDmg = Math.min(damage || 0, 500);
+    target.hp = Math.max(0, target.hp - validatedDmg);
+
+    io.to(currentIsland).emit("pvp:damage", {
+      attackerId: attacker.id,
+      targetId: target.id,
+      damage: validatedDmg,
+      targetHp: target.hp,
+    });
+
+    if (target.hp <= 0) {
+      io.to(currentIsland).emit("pvp:kill", {
+        killerId: attacker.id,
+        killerName: attacker.name,
+        victimId: target.id,
+        victimName: target.name,
+      });
+      // Respawn victim at island center after 5s
+      target.hp = target.maxHp;
+      target.x = 0; target.y = 20; target.z = 0;
+    }
+  });
+
+  // ── Island Chat ────────────────────────────────────────────────
+  socket.on("island:chat", (data) => {
+    if (!currentIsland) return;
+    const island = islands.get(currentIsland);
+    const player = island?.players.get(socket.id);
+    if (!player) return;
+    io.to(currentIsland).emit("island:chat", {
+      id: playerId,
+      name: player.name,
+      text: (data.text || "").slice(0, 300),
+    });
+  });
+
   // Disconnect
   socket.on("disconnect", () => {
     console.log(`[world] disconnected: ${socket.id}`);
+
+    // Leave island
+    if (currentIsland) {
+      const island = islands.get(currentIsland);
+      if (island) {
+        const player = island.players.get(socket.id);
+        island.players.delete(socket.id);
+        if (player) {
+          io.to(currentIsland).emit("island:player_left", { id: player.id, name: player.name });
+        }
+      }
+    }
+
+    // Leave world
     if (currentWorld) {
       const world = worlds.get(currentWorld);
       if (world) {
@@ -203,7 +555,6 @@ io.on("connection", (socket) => {
           io.to(currentWorld).emit("player:left", { id: player.id, name: player.name });
         }
         if (world.players.size === 0) {
-          // Keep world alive for 5 minutes in case host reconnects
           console.log(`[world] ${currentWorld} now empty`);
         }
       }
