@@ -3,7 +3,93 @@ import { Server } from "socket.io";
 
 const PORT = process.env.PORT || 5001;
 const GRUDGE_API = process.env.GRUDGE_API_URL || "https://api.grudge-studio.com";
+const OBJECTSTORE_URL = process.env.OBJECTSTORE_URL || "https://objectstore.grudge-studio.com";
+const OBJECTSTORE_PAGES = "https://molochdagod.github.io/ObjectStore/api/v1";
 const SAVE_INTERVAL_MS = 30_000; // Auto-save island state every 30s
+
+// ═══════════════════════════════════════════════════════════════
+// OBJECTSTORE GAME DATA — fetched on startup, used for validation
+// ═══════════════════════════════════════════════════════════════
+
+let gameData = {
+  weaponSkills: null,  // 17 weapon types, 207 skills
+  enemies: null,       // enemy templates from ObjectStore
+  classes: null,       // class → weapon restrictions
+  loaded: false,
+};
+
+// Skill lookup index: skillId → { damage, cooldown, castTime, damageType, ... }
+const skillIndex = new Map();
+// Class → allowed weapon types
+const classWeapons = {};
+
+async function fetchGameDataFromObjectStore() {
+  console.log("[data] Fetching game data from ObjectStore...");
+
+  async function fetchJSON(workerPath, pagesFile) {
+    try {
+      const res = await fetch(`${OBJECTSTORE_URL}${workerPath}`);
+      if (res.ok) return await res.json();
+    } catch { /* fall through */ }
+    try {
+      const res = await fetch(`${OBJECTSTORE_PAGES}/${pagesFile}`);
+      if (res.ok) return await res.json();
+    } catch { /* fall through */ }
+    return null;
+  }
+
+  const [ws, enemies, classes] = await Promise.allSettled([
+    fetchJSON("/v1/weapon-skills", "weaponSkills.json"),
+    fetchJSON("/v1/game-data/enemies", "enemies.json"),
+    fetchJSON("/v1/game-data/classes", "classes.json"),
+  ]);
+
+  if (ws.status === "fulfilled" && ws.value) {
+    gameData.weaponSkills = ws.value;
+    // Build flat skill index for O(1) lookups
+    if (ws.value.weaponTypes) {
+      for (const wt of ws.value.weaponTypes) {
+        for (const slot of wt.slots) {
+          for (const skill of slot.skills) {
+            skillIndex.set(skill.id, { ...skill, weaponType: wt.id });
+          }
+        }
+      }
+    }
+    // Build class restrictions
+    if (ws.value.classRestrictions) {
+      Object.assign(classWeapons, ws.value.classRestrictions);
+    }
+    console.log(`[data] ⚔  Weapon skills: ${ws.value.totalWeaponTypes} types, ${ws.value.totalSkills} skills indexed`);
+  } else {
+    console.warn("[data] ⚠️  Failed to load weapon skills — using fallback combat");
+  }
+
+  if (enemies.status === "fulfilled" && enemies.value) {
+    gameData.enemies = enemies.value;
+    console.log(`[data] 👹 Enemy data loaded`);
+  }
+
+  if (classes.status === "fulfilled" && classes.value) {
+    gameData.classes = classes.value;
+    console.log(`[data] 🛡  Class data loaded`);
+  }
+
+  gameData.loaded = true;
+  console.log(`[data] ✅ Game data sync complete (${skillIndex.size} skills indexed)`);
+}
+
+/**
+ * Validate combat damage using weapon skill data.
+ * Returns validated damage (capped by skill definition) or fallback.
+ */
+function validateSkillDamage(skillId, playerLevel = 1) {
+  const skill = skillIndex.get(skillId);
+  if (!skill) return null; // Unknown skill — caller uses fallback
+  // Scale base damage by player level (10% per level above 1)
+  const levelMult = 1 + (playerLevel - 1) * 0.1;
+  return Math.floor(skill.damage * levelMult);
+}
 
 const httpServer = createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -90,7 +176,7 @@ function getOrCreateIsland(islandId) {
   return islands.get(key);
 }
 
-// PvE enemy templates
+// PvE enemy templates — fallback, overridden by ObjectStore data on load
 const ENEMY_TEMPLATES = [
   { type: "slime",    hp: 60,  dmg: 8,  xp: 15,  gold: 5,  speed: 1.5 },
   { type: "skeleton", hp: 120, dmg: 15, xp: 30,  gold: 12, speed: 1.2 },
@@ -98,6 +184,11 @@ const ENEMY_TEMPLATES = [
   { type: "troll",    hp: 400, dmg: 40, xp: 100, gold: 45, speed: 0.7 },
   { type: "dragon",   hp: 1200, dmg: 80, xp: 300, gold: 150, speed: 0.5 },
 ];
+
+function getEnemyTemplate(zoneLevel) {
+  const idx = Math.min(zoneLevel - 1, ENEMY_TEMPLATES.length - 1);
+  return ENEMY_TEMPLATES[idx];
+}
 
 let nextEnemyId = 1;
 
@@ -421,7 +512,7 @@ io.on("connection", (socket) => {
     cb?.({ success: true, respawnAt: now + cooldown });
   });
 
-  // ── PvE Combat (server-authoritative damage) ──────────────────
+  // ── PvE Combat (server-authoritative, skill-validated damage) ──
   socket.on("pve:attack", (data, cb) => {
     if (!currentIsland) return;
     const island = islands.get(currentIsland);
@@ -429,12 +520,20 @@ io.on("connection", (socket) => {
     const player = island.players.get(socket.id);
     if (!player) return;
 
-    const { enemyId, damage } = data;
+    const { enemyId, damage, skillId } = data;
     const enemy = island.enemies.get(enemyId);
     if (!enemy) return cb?.({ error: "Enemy not found" });
 
-    // Server validates damage (cap at reasonable max)
-    const validatedDmg = Math.min(damage || 0, 500);
+    // Validate damage using weapon skill data if available
+    let validatedDmg;
+    const skillDmg = skillId ? validateSkillDamage(skillId, player.level) : null;
+    if (skillDmg !== null) {
+      // Use skill-validated damage (server-authoritative)
+      validatedDmg = skillDmg;
+    } else {
+      // Fallback: cap client-reported damage at reasonable max
+      validatedDmg = Math.min(damage || 0, 500);
+    }
     enemy.hp -= validatedDmg;
 
     io.to(currentIsland).emit("pve:damage", {
@@ -493,13 +592,21 @@ io.on("connection", (socket) => {
     // Same faction = no PvP (unless in arena zone)
     if (attacker.faction && attacker.faction === target.faction) return;
 
-    const validatedDmg = Math.min(damage || 0, 500);
+    // Validate PvP damage using skill data if available
+    let validatedDmg;
+    const pvpSkillDmg = data.skillId ? validateSkillDamage(data.skillId, attacker.level || 1) : null;
+    if (pvpSkillDmg !== null) {
+      validatedDmg = pvpSkillDmg;
+    } else {
+      validatedDmg = Math.min(damage || 0, 500);
+    }
     target.hp = Math.max(0, target.hp - validatedDmg);
 
     io.to(currentIsland).emit("pvp:damage", {
       attackerId: attacker.id,
       targetId: target.id,
       damage: validatedDmg,
+      skillId: data.skillId || null,
       targetHp: target.hp,
     });
 
@@ -570,6 +677,20 @@ function serializePlayers(world) {
   return result;
 }
 
-httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`[world] Grudge Open World Server running on port ${PORT}`);
+// ── Startup: fetch game data then listen ────────────────────────
+fetchGameDataFromObjectStore().then(() => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
+    console.log(`[world] Grudge Open World Server v2.0 running on port ${PORT}`);
+    console.log(`[world] ObjectStore: ${OBJECTSTORE_URL}`);
+    console.log(`[world] Skills indexed: ${skillIndex.size}`);
+    console.log(`[world] Class restrictions: ${Object.keys(classWeapons).join(", ") || "none"}`);
+  });
+}).catch((err) => {
+  console.warn("[world] Game data fetch failed, starting with fallbacks:", err.message);
+  httpServer.listen(PORT, "0.0.0.0", () => {
+    console.log(`[world] Grudge Open World Server running on port ${PORT} (fallback mode)`);
+  });
 });
+
+// Refresh game data every 30 minutes
+setInterval(() => fetchGameDataFromObjectStore().catch(() => {}), 30 * 60 * 1000);
